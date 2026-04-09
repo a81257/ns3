@@ -45,8 +45,8 @@ void UbRoutingProcess::AddShortestRoute(const uint32_t destIP, const std::vector
         target.insert(target.end(), (*(itRt->second)).begin(), (*(itRt->second)).end());
     }
     target.insert(target.end(), outPorts.begin(), outPorts.end());
-    std::vector<uint16_t> normalized = normalizePorts(target);
-    
+    std::vector<uint16_t> normalized = outPorts;
+
     // 查找或创建共享端口集合
     auto it = m_portSetPool.find(normalized);
     if (it != m_portSetPool.end()) {
@@ -70,7 +70,7 @@ void UbRoutingProcess::AddOtherRoute(const uint32_t destIP, const std::vector<ui
     }
     target.insert(target.end(), outPorts.begin(), outPorts.end());
     std::vector<uint16_t> normalized = normalizePorts(target);
-    
+
     // 查找或创建共享端口集合
     auto it = m_portSetPool.find(normalized);
     if (it != m_portSetPool.end()) {
@@ -118,7 +118,7 @@ void UbRoutingProcess::GetShortestCandidates(uint32_t &dip, uint16_t inPortId, s
 
     // 3. 过滤掉入端口
     if (inPortId != UINT16_MAX) {
-        auto it = std::remove_if(outPorts.begin(), outPorts.end(), 
+        auto it = std::remove_if(outPorts.begin(), outPorts.end(),
                                   [inPortId](uint16_t port) { return port == inPortId; });
         outPorts.erase(it, outPorts.end());
     }
@@ -140,7 +140,7 @@ void UbRoutingProcess::GetNonShortestCandidates(uint32_t &dip, uint16_t inPortId
 
     // 3. 过滤掉入端口
     if (inPortId != UINT16_MAX) {
-        auto it = std::remove_if(outPorts.begin(), outPorts.end(), 
+        auto it = std::remove_if(outPorts.begin(), outPorts.end(),
                                   [inPortId](uint16_t port) { return port == inPortId; });
         outPorts.erase(it, outPorts.end());
     }
@@ -187,11 +187,11 @@ int UbRoutingProcess::SelectAdaptiveOutPort(RoutingKey &rtKey, const std::vector
         }
         // 使用OutPort视图统计VOQ占用
         uint64_t voqLoad = queueManager->GetOutPortBufferUsed(outPort, static_cast<uint32_t>(priority));
-        
+
         // 加上EgressQueue的字节占用
         Ptr<UbPort> port = DynamicCast<UbPort>(node->GetDevice(outPort));
         uint64_t egressLoad = port->GetUbQueue()->GetCurrentBytes();
-        
+
         // 总负载 = VOQ + EgressQueue
         return voqLoad + egressLoad;
     };
@@ -252,12 +252,11 @@ uint64_t UbRoutingProcess::CalcHash(uint32_t sip, uint32_t dip, uint16_t sport, 
     return hash;
 }
 
-int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_t>& shortestPorts, 
+int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_t>& shortestPorts,
                                      const std::vector<uint16_t>& nonShortestPorts, bool &selectedShortestPath)
 {
     uint32_t sip = rtKey.sip;
     uint32_t dip = rtKey.dip;
-    uint16_t sport = rtKey.sport;
     uint16_t dport = rtKey.dport;
     uint8_t priority = rtKey.priority;
     bool usePacketSpray = rtKey.usePacketSpray;
@@ -268,16 +267,21 @@ int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_
         return -1;
     }
 
-    uint64_t hash64 = 0;
+    size_t idx = 0;
     if (usePacketSpray) {
-        hash64 = CalcHash(sip, dip, sport, dport, priority);
+        // Preserve duplicate outPorts as explicit weights and realize them with a
+        // switch-local round robin per flow. This makes packet spray honor weighted
+        // route lists over the packets actually observed at this hop.
+        uint64_t flowHash = CalcHash(sip, dip, 0, dport, priority);
+        uint64_t &sprayOffset = m_packetSprayOffsets[flowHash];
+        idx = static_cast<size_t>((flowHash + sprayOffset) % totalSize);
+        sprayOffset++;
     } else {
         // usePacketSpray == LB_MODE_PER_FLOW
-        hash64 = CalcHash(sip, dip, 0, 0, priority);
+        uint64_t hash64 = CalcHash(sip, dip, 0, 0, priority);
+        idx = static_cast<size_t>(hash64 % totalSize);
     }
-    
-    size_t idx = hash64 % totalSize;
-    
+
     // 通过索引判断是否选中最短路径，并直接返回对应集合中的端口
     if (idx < shortestPorts.size()) {
         selectedShortestPath = true;
@@ -309,9 +313,9 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
                 << " priority: " << (uint16_t)priority
                 << " useShortestPath: " << useShortestPath
                 << " usePacketSpray: " << usePacketSpray);
-    
+
     uint32_t tempDip = dip;
-    
+
     // 分别获取最短路径和非最短路径候选端口
     std::vector<uint16_t> shortestPorts;
     std::vector<uint16_t> nonShortestPorts;
@@ -320,7 +324,7 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
         // 只有在不限制最短路径时，才获取非最短路径候选端口
         GetNonShortestCandidates(tempDip, inPort, nonShortestPorts);
     }
-    
+
     // 检查是否有可用端口
     if (shortestPorts.empty() && nonShortestPorts.empty()) {
         NS_LOG_ERROR("No candidate ports found for dip: " << Ipv4Address(dip));
@@ -337,7 +341,7 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
 
     // 若找不到出端口，报ASSERT
     NS_ASSERT_MSG(outPortId != -1, "No available output port found");
-    
+
     return outPortId;
 }
 } // namespace ns3
